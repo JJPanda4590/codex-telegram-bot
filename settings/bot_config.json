@@ -1,0 +1,20 @@
+{
+  "telegram_bot_token": "8762152189:AAEPSvsnUR7GWTT_x0bRfL_Mp1cvTAvNvXo",
+  "whitelist": [
+    8767033380,
+    8551364605
+  ],
+  "codex_cli_fallback_paths": [
+    "/Applications/Codex.app/Contents/Resources/codex"
+  ],
+  "codex_model": "gpt-5.4",
+  "codex_reasoning_effort": "medium",
+  "openai_admin_api_key": "",
+  "openai_organization_id": "",
+  "openai_project_id": "",
+  "session_store_path": "sessions.json",
+  "request_timeout_seconds": 28800.0,
+  "project_path": ".",
+  "file_browser_enabled": true,
+  "log_level": "INFO"
+}
