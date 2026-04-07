@@ -7,10 +7,10 @@
 这是一个偏生产可用的 Telegram 机器人项目：把已授权 Telegram 用户的消息转发给本地 `codex` CLI，再把结果回传到 Telegram。
 
 简要描述：
-一个面向生产环境的高可用 Telegram + Codex 桥接机器人，主打安全鉴权、多会话持久化、本地线程延续，以及可直接在聊天中完成高质量命令协作。
+通过 Telegram 聊天随时控制电脑上的 Codex，同时支持多会话协作，以及模型切换、运行参数调整等丰富指令。
 
 Brief description:
-An elegant production-ready Telegram bridge for Codex, designed for secure multi-session collaboration, persistent local threads, and smooth command execution directly from chat.
+Control the Codex running on your computer anytime through Telegram chat, with support for multi-session workflows plus rich in-chat commands for model selection and runtime adjustments.
 
 ## Amazing 功能
 
