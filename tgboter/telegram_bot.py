@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+from tgboter.change_tracker import FileChange, WorkspaceSnapshot
 from tgboter.codex_client import CodexClient, CodexExecutionStopped, CodexStreamEvent, CodexUsage
 from tgboter.config import Config, SUPPORTED_REASONING_EFFORTS, UserSessionState
 from tgboter.i18n import I18n, SUPPORTED_LANGUAGES
@@ -63,6 +64,7 @@ BOT_MENU_COMMAND_NAMES: Final[tuple[str, ...]] = (
     "status",
     "restart",
 )
+MAX_COMPLETION_CHANGE_FILES: Final[int] = 12
 
 
 class TelegramCodexBot:
@@ -453,6 +455,7 @@ class TelegramCodexBot:
             await self._register_active_request(current_task)
 
         try:
+            before_snapshot = self._capture_workspace_snapshot()
             backend_session_id = await self.store.get_backend_session_id(user.id, session_id=session_id)
             started_at = time.perf_counter()
 
@@ -498,6 +501,12 @@ class TelegramCodexBot:
                     update,
                     self._build_completion_text(elapsed_seconds, result.usage, language=language),
                 )
+                file_changes = self._workspace_changes_since(before_snapshot)
+                if file_changes:
+                    await self._safe_reply(
+                        update,
+                        self._build_change_summary_text(file_changes, language=language),
+                    )
                 return
             if result.backend_session_id:
                 await self.store.set_backend_session_id(
@@ -512,10 +521,16 @@ class TelegramCodexBot:
                 parse_mode=ParseMode.MARKDOWN,
             )
             elapsed_seconds = time.perf_counter() - started_at
+            file_changes = self._workspace_changes_since(before_snapshot)
             await self._safe_reply(
                 update,
                 self._build_completion_text(elapsed_seconds, result.usage, language=language),
             )
+            if file_changes:
+                await self._safe_reply(
+                    update,
+                    self._build_change_summary_text(file_changes, language=language),
+                )
             await self.store.append_message(user.id, "assistant", reply, session_id=session_id)
         except TimeoutError:
             LOGGER.exception("Codex request timeout user_id=%s session_id=%s", user.id, session_id)
@@ -2024,6 +2039,42 @@ class TelegramCodexBot:
             return self._t("completion.token_unavailable", language=language, summary=summary)
         token_joiner = "，" if language == "zh" else ", "
         return self._t("completion.with_tokens", language=language, summary=summary, tokens=token_joiner.join(token_parts))
+
+    def _build_change_summary_text(self, changes: list[FileChange], *, language: str) -> str:
+        """Build a compact file-change summary for the current Codex run."""
+        lines = [self._t("completion.changes_title", language=language)]
+        visible_changes = changes[:MAX_COMPLETION_CHANGE_FILES]
+        for change in visible_changes:
+            detail = self._format_file_change_detail(change, language=language)
+            lines.append(f"- {change.path} ({detail})")
+        remaining = len(changes) - len(visible_changes)
+        if remaining > 0:
+            lines.append(self._t("completion.changes_more", language=language, count=remaining))
+        return "\n".join(lines)
+
+    def _format_file_change_detail(self, change: FileChange, *, language: str) -> str:
+        """Render per-file line deltas when text content is available."""
+        if change.added_lines is None or change.removed_lines is None:
+            return self._t("completion.changes_binary", language=language)
+        return f"+{change.added_lines}/-{change.removed_lines}"
+
+    def _capture_workspace_snapshot(self) -> WorkspaceSnapshot | None:
+        """Capture a best-effort view of the current project tree."""
+        try:
+            return WorkspaceSnapshot.capture(self.project_path)
+        except Exception:
+            LOGGER.exception("Workspace snapshot capture failed for %s", self.project_path)
+            return None
+
+    def _workspace_changes_since(self, before_snapshot: WorkspaceSnapshot | None) -> list[FileChange]:
+        """Return file changes relative to an earlier snapshot without failing the request."""
+        if before_snapshot is None:
+            return []
+        try:
+            return before_snapshot.diff(WorkspaceSnapshot.capture(self.project_path))
+        except Exception:
+            LOGGER.exception("Workspace snapshot diff failed for %s", self.project_path)
+            return []
 
     @staticmethod
     def _format_elapsed(elapsed_seconds: float) -> str:
