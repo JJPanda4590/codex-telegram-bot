@@ -1,3 +1,5 @@
+MIT License
+
 [中文](./README.zh-CN.md) | English
 
 # Codex Telegram Command Center
@@ -203,3 +205,5 @@ python3 -m compileall .
 - Telegram messages have a size limit; the bot splits long replies safely.
 - If Markdown formatting is rejected by Telegram, the bot falls back gracefully.
 - Session data is stored locally in JSON by default.
+
+power by codex pro

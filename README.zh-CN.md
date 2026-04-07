@@ -1,10 +1,12 @@
+MIT License
+
 中文 | [English](./README.md)
 
 # Codex Telegram Command Center
 
 版本：`1.0.0`
 
-这是一个偏生产可用的 Telegram 机器人项目：把已授权 Telegram 用户的消息转发给本地 `codex` CLI，再把结果回传到 Telegram。
+这是一个偏生产可用的 Telegram 机器人项目：把白名单中的 Telegram 用户消息转发给本地 `codex` CLI，再把结果回传到 Telegram。
 
 简要描述：
 一个面向生产环境的高可用 Telegram + Codex 桥接机器人，主打安全鉴权、多会话持久化、本地线程延续，以及可直接在聊天中完成高质量命令协作。
@@ -203,3 +205,5 @@ python3 -m compileall .
 - Telegram 单条消息长度有限，机器人会自动安全分片。
 - 如果 Markdown 被 Telegram 拒绝，程序会自动降级为普通文本回复。
 - 默认会话数据存储在本地 JSON 文件中。
+
+power by codex pro
