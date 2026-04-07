@@ -1,0 +1,17 @@
+{
+  "telegram_bot_token": "",
+  "whitelist": [123456789],
+  "codex_cli_fallback_paths": [],
+  "codex_model": "gpt-4.1-mini",
+  "codex_reasoning_effort": "medium",
+  "openai_admin_api_key": "",
+  "openai_organization_id": "",
+  "openai_project_id": "",
+  "session_store_path": "sessions.json",
+  "request_timeout_seconds": 28800,
+  "project_path": ".",
+  "file_browser_enabled": false,
+  "log_level": "INFO",
+  "default_language": "zh",
+  "translations_path": "settings/i18n.json"
+}
