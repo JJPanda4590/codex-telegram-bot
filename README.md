@@ -183,7 +183,7 @@ python3 -m compileall .
 - `/session_details`: show detailed session information
 - `/session_switch <id>`: switch active session
 - `/session_reset`: clear the current session history
-- `/project [path]`: show or switch the active project directory
+- `/project [path]`: open a button-based project selector, or switch directly when a path is provided
 - `/files`: list files in the configured project path
 - `/usage`: show OpenAI usage summary when admin API credentials are configured
 - `/stop`: stop running Codex tasks

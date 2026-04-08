@@ -183,7 +183,7 @@ python3 -m compileall .
 - `/session_details`：查看详细会话信息
 - `/session_switch <id>`：切换当前会话
 - `/session_reset`：清空当前会话历史
-- `/project [path]`：查看或切换当前项目目录
+- `/project [path]`：打开按钮式项目选择器；如果带路径参数则直接切换
 - `/files`：列出当前项目目录文件
 - `/usage`：在配置了 OpenAI 管理接口凭据时查看用量
 - `/stop`：停止当前运行中的 Codex 任务

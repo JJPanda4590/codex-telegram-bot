@@ -365,47 +365,21 @@ class TelegramCodexBot:
         language = await self._user_language(update.effective_user.id)
 
         if not context.args:
-            await self._safe_reply(
-                update,
-                self._t("message.project_current", language=language, path=self.project_path),
-                parse_mode=ParseMode.MARKDOWN,
+            selector_root = self.project_path.parent if self.project_path.parent != self.project_path else self.project_path
+            text, reply_markup, parse_mode = self._build_project_selector_view(
+                selector_root,
+                language=language,
+                page=0,
             )
+            await self._safe_reply(update, text, parse_mode=parse_mode, reply_markup=reply_markup)
             return
 
         requested_path = Path(" ".join(context.args)).expanduser()
         if not requested_path.is_absolute():
             requested_path = (self.project_path / requested_path).resolve()
-
-        if not requested_path.exists():
-            await self._safe_reply(
-                update,
-                self._t("message.project_missing", language=language, path=requested_path),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-        if not requested_path.is_dir():
-            await self._safe_reply(
-                update,
-                self._t("message.project_not_dir", language=language, path=requested_path),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-
-        self.project_path = requested_path
-        self.config.project_path = str(requested_path)
-        self.codex_client.set_project_path(requested_path)
-        self.config.save()
-
-        session_id = await self.store.reset_current_session(update.effective_user.id)
-        LOGGER.info("Switched project path to %s and reset session=%s", requested_path, session_id)
         await self._safe_reply(
             update,
-            self._t(
-                "message.project_switched",
-                language=language,
-                path=requested_path,
-                session_id=session_id,
-            ),
+            await self._switch_project_path(update.effective_user.id, requested_path, language=language),
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -638,6 +612,21 @@ class TelegramCodexBot:
             )
             return
 
+        if data == "view:project":
+            selector_root = self.project_path.parent if self.project_path.parent != self.project_path else self.project_path
+            text, reply_markup, parse_mode = self._build_project_selector_view(
+                selector_root,
+                language=language,
+                page=0,
+            )
+            await self._safe_edit_text(
+                query.message,
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return
+
         if data == "action:new_session":
             session_id = await self.store.create_session(user.id)
             LOGGER.info("Created new session from callback user_id=%s session_id=%s", user.id, session_id)
@@ -763,6 +752,37 @@ class TelegramCodexBot:
                 text,
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
+            )
+            return
+
+        if data.startswith("project:dir:"):
+            path, page = self._resolve_file_browser_target(data, prefix="project:dir:")
+            if path is None:
+                await query.answer(self._t("project.invalid_target", language=language), show_alert=True)
+                return
+            text, reply_markup, parse_mode = self._build_project_selector_view(
+                path,
+                language=language,
+                page=page,
+            )
+            await self._safe_edit_text(
+                query.message,
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return
+
+        if data.startswith("project:select:"):
+            path, _ = self._resolve_file_browser_target(data, prefix="project:select:")
+            if path is None:
+                await query.answer(self._t("project.invalid_target", language=language), show_alert=True)
+                return
+            await self._safe_edit_text(
+                query.message,
+                await self._switch_project_path(user.id, path, language=language),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._build_selector_keyboard(language=language, mode="status"),
             )
             return
 
@@ -1217,6 +1237,7 @@ class TelegramCodexBot:
                         InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                     ],
                     [
+                        InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
                         InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
                     ],
                     [
@@ -1240,6 +1261,7 @@ class TelegramCodexBot:
                     InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                 ],
                 [
+                    InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
                     InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
                 ],
             ]
@@ -1390,6 +1412,103 @@ class TelegramCodexBot:
         ]
         return text, InlineKeyboardMarkup(rows), None
 
+    def _build_project_selector_view(
+        self,
+        path: Path,
+        *,
+        language: str,
+        page: int,
+    ) -> tuple[str, InlineKeyboardMarkup, str | None]:
+        """Render a directory-only browser used to switch the active project path."""
+        resolved = path.expanduser().resolve()
+        if not resolved.exists():
+            text = self._t("message.project_missing", language=language, path=resolved)
+            return text, self._project_selector_footer(language), ParseMode.MARKDOWN
+        if not resolved.is_dir():
+            text = self._t("message.project_not_dir", language=language, path=resolved)
+            return text, self._project_selector_footer(language), ParseMode.MARKDOWN
+
+        try:
+            entries = sorted(
+                [entry for entry in resolved.iterdir() if entry.is_dir()],
+                key=lambda item: item.name.lower(),
+            )
+        except OSError as exc:
+            text = self._t("files.path_denied", language=language, path=resolved, error=exc)
+            return text, self._project_selector_footer(language), ParseMode.MARKDOWN
+
+        total_pages = max(1, (len(entries) + FILE_BROWSER_PAGE_SIZE - 1) // FILE_BROWSER_PAGE_SIZE)
+        current_page = min(max(page, 0), total_pages - 1)
+        start = current_page * FILE_BROWSER_PAGE_SIZE
+        end = start + FILE_BROWSER_PAGE_SIZE
+        page_entries = entries[start:end]
+
+        if page_entries:
+            text = self._t(
+                "project.selector.summary",
+                language=language,
+                current_path=self.project_path,
+                path=resolved,
+                page=current_page + 1,
+                total_pages=total_pages,
+                count=len(entries),
+            )
+        else:
+            text = self._t(
+                "project.selector.empty",
+                language=language,
+                current_path=self.project_path,
+                path=resolved,
+            )
+
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    self._t("keyboard.select_current_project", language=language),
+                    callback_data=f"project:select:{self._register_file_browser_target(resolved)}:0",
+                )
+            ]
+        ]
+
+        if resolved.parent != resolved:
+            parent_token = self._register_file_browser_target(resolved.parent)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        self._t("keyboard.parent", language=language),
+                        callback_data=f"project:dir:{parent_token}:0",
+                    )
+                ]
+            )
+
+        for entry in page_entries:
+            token = self._register_file_browser_target(entry)
+            label = self._trim_button_label(f"📁 {entry.name}")
+            rows.append([InlineKeyboardButton(label, callback_data=f"project:dir:{token}:0")])
+
+        if total_pages > 1:
+            current_token = self._register_file_browser_target(resolved)
+            paging_row: list[InlineKeyboardButton] = []
+            if current_page > 0:
+                paging_row.append(
+                    InlineKeyboardButton(
+                        self._t("keyboard.prev_page", language=language),
+                        callback_data=f"project:dir:{current_token}:{current_page - 1}",
+                    )
+                )
+            if current_page < total_pages - 1:
+                paging_row.append(
+                    InlineKeyboardButton(
+                        self._t("keyboard.next_page", language=language),
+                        callback_data=f"project:dir:{current_token}:{current_page + 1}",
+                    )
+                )
+            if paging_row:
+                rows.append(paging_row)
+
+        rows.extend(self._project_selector_footer_rows(language))
+        return text, InlineKeyboardMarkup(rows), ParseMode.MARKDOWN
+
     def _read_file_preview_content(self, path: Path, *, language: str) -> str:
         """Read a best-effort text preview while staying inside Telegram limits."""
         preview_budget = TELEGRAM_SAFE_TEXT_LIMIT - max(200, len(str(path)))
@@ -1441,6 +1560,19 @@ class TelegramCodexBot:
 
     def _file_browser_footer_rows(self, language: str) -> list[list[InlineKeyboardButton]]:
         """Build footer rows shared by file browser screens."""
+        return [
+            [
+                InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
+                InlineKeyboardButton(self._t("keyboard.help", language=language), callback_data="view:help"),
+            ]
+        ]
+
+    def _project_selector_footer(self, language: str) -> InlineKeyboardMarkup:
+        """Build the common footer keyboard for project selector screens."""
+        return InlineKeyboardMarkup(self._project_selector_footer_rows(language))
+
+    def _project_selector_footer_rows(self, language: str) -> list[list[InlineKeyboardButton]]:
+        """Build footer rows shared by project selector screens."""
         return [
             [
                 InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
@@ -1504,6 +1636,30 @@ class TelegramCodexBot:
         if self.config.codex_model not in models:
             models.insert(0, self.config.codex_model)
         return models[:8]
+
+    async def _switch_project_path(self, user_id: int, requested_path: Path, *, language: str) -> str:
+        """Validate and switch the active project path, resetting the user's current session."""
+        resolved = requested_path.expanduser().resolve()
+        if not resolved.exists():
+            return self._t("message.project_missing", language=language, path=resolved)
+        if not resolved.is_dir():
+            return self._t("message.project_not_dir", language=language, path=resolved)
+        if resolved == self.project_path:
+            return self._t("message.project_current", language=language, path=resolved)
+
+        self.project_path = resolved
+        self.config.project_path = str(resolved)
+        self.codex_client.set_project_path(resolved)
+        self.config.save()
+
+        session_id = await self.store.reset_current_session(user_id)
+        LOGGER.info("Switched project path to %s and reset session=%s", resolved, session_id)
+        return self._t(
+            "message.project_switched",
+            language=language,
+            path=resolved,
+            session_id=session_id,
+        )
 
     async def _send_long_message(
         self,
