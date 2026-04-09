@@ -82,8 +82,7 @@ class CodexClient:
             backend_session_id=backend_session_id,
         )
         LOGGER.info(
-            "Executing CLI backend=%s session=%s model=%s cwd=%s",
-            self.config.active_cli,
+            "Executing Codex CLI session=%s model=%s cwd=%s",
             backend_session_id or "(new)",
             self.config.codex_model,
             resolved_project_path,

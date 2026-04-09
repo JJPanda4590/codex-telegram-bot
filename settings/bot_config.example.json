@@ -1,11 +1,8 @@
 {
   "telegram_bot_token": "",
   "whitelist": [123456789],
-  "active_cli": "codex",
   "codex_cli_path": "codex",
   "codex_cli_fallback_paths": [],
-  "google_antigravity_cli_path": "google-antigravity",
-  "google_antigravity_cli_fallback_paths": [],
   "codex_model": "gpt-4.1-mini",
   "codex_reasoning_effort": "medium",
   "openai_admin_api_key": "",

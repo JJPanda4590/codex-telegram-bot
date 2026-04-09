@@ -21,15 +21,10 @@ class Config:
 
     telegram_bot_token: str
     whitelist: list[int]
-    active_cli: str = "codex"
     codex_cli_path: str = "codex"
     codex_cli_fallback_paths: list[str] = field(default_factory=list)
-    google_antigravity_cli_path: str = "google-antigravity"
-    google_antigravity_cli_fallback_paths: list[str] = field(default_factory=list)
     codex_cli_use_shell: bool = False
-    google_antigravity_cli_use_shell: bool = False
     codex_shell_path: str = ""
-    google_antigravity_shell_path: str = ""
     codex_model: str = "gpt-4.1-mini"
     codex_reasoning_effort: str = "medium"
     openai_admin_api_key: str = ""
@@ -65,16 +60,9 @@ class Config:
         config = cls(
             telegram_bot_token=payload.get("telegram_bot_token", ""),
             whitelist=whitelist,
-            active_cli=str(payload.get("active_cli", "codex")).strip().lower() or "codex",
             codex_cli_path=str(payload.get("codex_cli_path") or "codex"),
             codex_cli_fallback_paths=[
                 str(item) for item in payload.get("codex_cli_fallback_paths", [])
-            ],
-            google_antigravity_cli_path=str(
-                payload.get("google_antigravity_cli_path") or "google-antigravity"
-            ),
-            google_antigravity_cli_fallback_paths=[
-                str(item) for item in payload.get("google_antigravity_cli_fallback_paths", [])
             ],
             codex_model=payload.get("codex_model", "gpt-4.1-mini"),
             codex_reasoning_effort=str(payload.get("codex_reasoning_effort", "medium")).lower(),
@@ -101,8 +89,6 @@ class Config:
         """Validate required fields before startup."""
         if not self.telegram_bot_token:
             raise ValueError("'telegram_bot_token' is required")
-        if self.active_cli not in self.supported_cli_names():
-            raise ValueError("'active_cli' must be one of: " + ", ".join(self.supported_cli_names()))
         if self.request_timeout_seconds <= 0:
             raise ValueError("'request_timeout_seconds' must be > 0")
         if self.stream_update_min_interval_seconds < 0:
@@ -121,12 +107,7 @@ class Config:
                 + ", ".join(SUPPORTED_REASONING_EFFORTS)
             )
         self._validate_cli_config("codex", self.codex_cli_path, self.codex_cli_fallback_paths)
-        self._validate_cli_config(
-            "google-antigravity",
-            self.google_antigravity_cli_path,
-            self.google_antigravity_cli_fallback_paths,
-        )
-        self.activate_cli(self.active_cli)
+        self._activate_codex_cli()
 
     def save(self) -> None:
         """Persist the active configuration back to disk."""
@@ -136,11 +117,8 @@ class Config:
         payload = {
             "telegram_bot_token": self.telegram_bot_token,
             "whitelist": self.whitelist,
-            "active_cli": self.active_cli,
             "codex_cli_path": self.codex_cli_path,
             "codex_cli_fallback_paths": self.codex_cli_fallback_paths,
-            "google_antigravity_cli_path": self.google_antigravity_cli_path,
-            "google_antigravity_cli_fallback_paths": self.google_antigravity_cli_fallback_paths,
             "codex_model": self.codex_model,
             "codex_reasoning_effort": self.codex_reasoning_effort,
             "openai_admin_api_key": self.openai_admin_api_key,
@@ -159,36 +137,23 @@ class Config:
         with self.config_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
 
-    @staticmethod
-    def supported_cli_names() -> tuple[str, ...]:
-        """Return the supported CLI backends."""
-        return ("codex", "google-antigravity")
-
-    @staticmethod
-    def cli_display_name(cli_name: str) -> str:
-        """Return a user-facing backend name."""
-        return "Google Antigravity" if cli_name == "google-antigravity" else "Codex"
-
-    def activate_cli(self, cli_name: str) -> None:
-        """Resolve and activate the selected CLI backend."""
-        resolved_name = cli_name.strip().lower()
-        if resolved_name not in self.supported_cli_names():
-            raise ValueError(f"Unsupported CLI: {cli_name}")
-
-        resolved_path, use_shell = self.resolve_cli_path(resolved_name)
+    def _activate_codex_cli(self) -> None:
+        """Resolve and activate the configured Codex CLI."""
+        resolved_path, use_shell = self.resolve_cli_path()
         if not resolved_path:
-            configured, fallbacks = self._cli_locator_settings(resolved_name)
             raise ValueError(
-                f"{self.cli_display_name(resolved_name)} CLI not found. Checked: "
-                + ", ".join([configured, *fallbacks])
+                "Codex CLI not found. Checked: "
+                + ", ".join([self.codex_cli_path.strip() or "codex", *self.codex_cli_fallback_paths])
             )
 
-        self.active_cli = resolved_name
-        self._set_cli_runtime(resolved_name, resolved_path, use_shell)
+        shell_path = os.environ.get("SHELL", "/bin/sh")
+        self.codex_cli_path = resolved_path
+        self.codex_cli_use_shell = use_shell
+        self.codex_shell_path = shell_path
 
-    def resolve_cli_path(self, cli_name: str) -> tuple[str | None, bool]:
-        """Resolve the configured CLI path or a configured fallback location."""
-        configured_name, fallback_paths = self._cli_locator_settings(cli_name)
+    def resolve_cli_path(self) -> tuple[str | None, bool]:
+        """Resolve the configured Codex CLI path or a configured fallback location."""
+        configured_name = self.codex_cli_path.strip() or "codex"
         configured = Path(configured_name).expanduser()
         if configured.is_file():
             return str(configured), False
@@ -197,7 +162,7 @@ class Config:
         if discovered:
             return discovered, False
 
-        for candidate in fallback_paths:
+        for candidate in self.codex_cli_fallback_paths:
             candidate_path = Path(candidate).expanduser()
             if candidate_path.is_file():
                 return str(candidate_path), False
@@ -211,49 +176,16 @@ class Config:
         return None, False
 
     def cli_path(self) -> str:
-        """Return the resolved executable path for the active CLI."""
-        return (
-            self.google_antigravity_cli_path
-            if self.active_cli == "google-antigravity"
-            else self.codex_cli_path
-        )
+        """Return the resolved executable path for Codex."""
+        return self.codex_cli_path
 
     def cli_use_shell(self) -> bool:
-        """Return whether the active CLI should be invoked via a login shell."""
-        return (
-            self.google_antigravity_cli_use_shell
-            if self.active_cli == "google-antigravity"
-            else self.codex_cli_use_shell
-        )
+        """Return whether Codex should be invoked via a login shell."""
+        return self.codex_cli_use_shell
 
     def cli_shell_path(self) -> str:
-        """Return the shell path for the active CLI."""
-        return (
-            self.google_antigravity_shell_path
-            if self.active_cli == "google-antigravity"
-            else self.codex_shell_path
-        )
-
-    def _cli_locator_settings(self, cli_name: str) -> tuple[str, list[str]]:
-        """Return the configured executable name and fallback list for a CLI."""
-        if cli_name == "google-antigravity":
-            return (
-                self.google_antigravity_cli_path.strip() or "google-antigravity",
-                self.google_antigravity_cli_fallback_paths,
-            )
-        return (self.codex_cli_path.strip() or "codex", self.codex_cli_fallback_paths)
-
-    def _set_cli_runtime(self, cli_name: str, resolved_path: str, use_shell: bool) -> None:
-        """Persist the resolved executable details for a CLI."""
-        shell_path = os.environ.get("SHELL", "/bin/sh")
-        if cli_name == "google-antigravity":
-            self.google_antigravity_cli_path = resolved_path
-            self.google_antigravity_cli_use_shell = use_shell
-            self.google_antigravity_shell_path = shell_path
-            return
-        self.codex_cli_path = resolved_path
-        self.codex_cli_use_shell = use_shell
-        self.codex_shell_path = shell_path
+        """Return the shell path used to launch Codex."""
+        return self.codex_shell_path
 
     @staticmethod
     def _validate_cli_config(cli_name: str, cli_path: str, fallback_paths: list[str]) -> None:

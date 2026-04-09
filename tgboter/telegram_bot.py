@@ -25,7 +25,12 @@ from telegram.ext import (
     filters,
 )
 
-from tgboter.codex_client import CodexClient, CodexExecutionStopped, CodexStreamEvent, CodexUsage
+from tgboter.codex_client import (
+    CodexClient,
+    CodexExecutionStopped,
+    CodexStreamEvent,
+    CodexUsage,
+)
 from tgboter.config import Config, SUPPORTED_REASONING_EFFORTS, UserSessionState
 from tgboter.i18n import I18n, SUPPORTED_LANGUAGES
 from tgboter.openai_usage_client import OpenAIUsageClient
@@ -440,7 +445,7 @@ class TelegramCodexBot:
         try:
             backend_session_id = await self.store.get_backend_session_id(
                 user.id,
-                self.config.active_cli,
+                "codex",
                 session_id=session_id,
             )
             started_at = time.perf_counter()
@@ -498,7 +503,7 @@ class TelegramCodexBot:
             if result.backend_session_id:
                 await self.store.set_backend_session_id(
                     user.id,
-                    self.config.active_cli,
+                    "codex",
                     result.backend_session_id,
                     session_id=session_id,
                 )
@@ -677,15 +682,6 @@ class TelegramCodexBot:
             )
             return
 
-        if data in {"selector:cli", "view:cli"}:
-            await self._safe_edit_text(
-                query.message,
-                await self._status_text(user.id, extra=self._t("message.select_cli", language=language)),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=self._build_selector_keyboard(language=language, mode="cli"),
-            )
-            return
-
         if data in {"selector:reasoning", "view:reasoning"}:
             await self._safe_edit_text(
                 query.message,
@@ -717,36 +713,6 @@ class TelegramCodexBot:
                 ),
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=self._build_selector_keyboard(language=language, mode="status"),
-            )
-            return
-
-        if data.startswith("set:cli:"):
-            cli_name = data.removeprefix("set:cli:")
-            if cli_name not in self.config.supported_cli_names():
-                await query.answer(self._t("callback.invalid_cli", language=language), show_alert=True)
-                return
-            try:
-                self.config.activate_cli(cli_name)
-                self.config.save()
-            except ValueError as exc:
-                await query.answer(
-                    self._t("message.cli_unavailable", language=language, cli_name=self.config.cli_display_name(cli_name), error=exc),
-                    show_alert=True,
-                )
-                return
-            LOGGER.info("CLI backend changed by user_id=%s cli=%s", user.id, cli_name)
-            await self._safe_edit_text(
-                query.message,
-                await self._help_text(
-                    user.id,
-                    extra=self._t(
-                        "message.cli_switched",
-                        language=language,
-                        cli_name=self.config.cli_display_name(cli_name),
-                    ),
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=self._build_selector_keyboard(language=language, mode="help"),
             )
             return
 
@@ -947,11 +913,6 @@ class TelegramCodexBot:
                 self._t("help.current_title", language=language, title=current_title),
                 self._t("help.session_count", language=language, count=len(state.sessions)),
                 self._t(
-                    "help.current_cli",
-                    language=language,
-                    cli_name=self.config.cli_display_name(self.config.active_cli),
-                ),
-                self._t(
                     "help.current_language",
                     language=language,
                     language_name=self._language_name(language, display_language=language),
@@ -963,7 +924,6 @@ class TelegramCodexBot:
                 self._t("help.action.session_details", language=language),
                 self._t("help.action.project", language=language),
                 self._t("help.action.file_browser", language=language),
-                self._t("help.action.cli", language=language),
                 self._t("help.action.stop", language=language),
                 self._t("help.action.restart", language=language),
                 "",
@@ -985,14 +945,12 @@ class TelegramCodexBot:
         current_session_id = state.current_session or ""
         current_project_path = await self._current_project_path(user_id, session_id=current_session_id)
         current_messages = state.sessions.get(current_session_id, [])
-        backend_session_id = state.backend_sessions.get(current_session_id, {}).get(self.config.active_cli)
+        backend_session_id = state.backend_sessions.get(current_session_id, {}).get("codex")
         total_messages = sum(len(messages) for messages in state.sessions.values())
         current_user_messages = sum(1 for message in current_messages if message.get("role") == "user")
         current_assistant_messages = sum(1 for message in current_messages if message.get("role") == "assistant")
         active_requests = await self._active_request_count()
-        bound_sessions = sum(
-            1 for mapping in state.backend_sessions.values() if self.config.active_cli in mapping
-        )
+        bound_sessions = sum(1 for mapping in state.backend_sessions.values() if "codex" in mapping)
         titled_sessions = sum(
             1
             for messages in state.sessions.values()
@@ -1005,11 +963,6 @@ class TelegramCodexBot:
         parts.extend(
             [
                 self._t("status.runtime", language=language),
-                self._t(
-                    "status.cli",
-                    language=language,
-                    cli_name=self.config.cli_display_name(self.config.active_cli),
-                ),
                 self._t("status.model", language=language, model=self.config.codex_model),
                 self._t("status.reasoning", language=language, effort=self.config.codex_reasoning_effort),
                 self._t("status.project_path", language=language, path=current_project_path),
@@ -1147,7 +1100,7 @@ class TelegramCodexBot:
             title = self._session_title(messages, language=language)
             if detailed:
                 backend_session_id = state.backend_sessions.get(session_id, {}).get(
-                    self.config.active_cli,
+                    "codex",
                     self._t("session.new_thread", language=language),
                 )
                 lines.append(
@@ -1235,7 +1188,7 @@ class TelegramCodexBot:
         for session_id, messages in reversed(session_items):
             marker = self._t("session.list.current_marker", language=language) if session_id == state.current_session else ""
             backend_session_id = state.backend_sessions.get(session_id, {}).get(
-                self.config.active_cli,
+                "codex",
                 self._t("session.new_thread", language=language),
             )
             lines.append(
@@ -1277,16 +1230,6 @@ class TelegramCodexBot:
         """Build distinct keyboards for help, status, and config selection."""
         if mode == "models":
             rows = self._build_model_rows()
-            rows.append(
-                [
-                    InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
-                    InlineKeyboardButton(self._t("keyboard.help", language=language), callback_data="view:help"),
-                ]
-            )
-            return InlineKeyboardMarkup(rows)
-
-        if mode == "cli":
-            rows = self._build_cli_rows(language)
             rows.append(
                 [
                     InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
@@ -1337,16 +1280,16 @@ class TelegramCodexBot:
                         InlineKeyboardButton(self._t("keyboard.token_usage", language=language), callback_data="view:token"),
                     ],
                     [
-                        InlineKeyboardButton(self._t("keyboard.cli", language=language), callback_data="view:cli"),
+                        InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                         InlineKeyboardButton(self._t("keyboard.models", language=language), callback_data="view:models"),
                     ],
                     [
-                        InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                         InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
+                        InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
                     ],
                     [
                         InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
-                        InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
+                        InlineKeyboardButton(self._t("keyboard.help", language=language), callback_data="view:help"),
                     ],
                 ]
             )
@@ -1362,16 +1305,16 @@ class TelegramCodexBot:
                     InlineKeyboardButton(self._t("keyboard.token_usage", language=language), callback_data="view:token"),
                 ],
                 [
-                    InlineKeyboardButton(self._t("keyboard.cli", language=language), callback_data="view:cli"),
+                    InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                     InlineKeyboardButton(self._t("keyboard.models", language=language), callback_data="view:models"),
                 ],
                 [
-                    InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                     InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
+                    InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
                 ],
                 [
                     InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
-                    InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
+                    InlineKeyboardButton(self._t("keyboard.help", language=language), callback_data="view:help"),
                 ],
             ]
         )
@@ -1724,21 +1667,6 @@ class TelegramCodexBot:
                 buttons = []
         if buttons:
             rows.append(buttons)
-        return rows
-
-    def _build_cli_rows(self, language: str) -> list[list[InlineKeyboardButton]]:
-        """Build buttons for supported CLI backends."""
-        rows: list[list[InlineKeyboardButton]] = []
-        for cli_name in self.config.supported_cli_names():
-            label = f"{'• ' if cli_name == self.config.active_cli else ''}{self.config.cli_display_name(cli_name)}"
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        self._trim_button_label(label, limit=32),
-                        callback_data=f"set:cli:{cli_name}",
-                    )
-                ]
-            )
         return rows
 
     def _build_reasoning_rows(self) -> list[list[InlineKeyboardButton]]:
