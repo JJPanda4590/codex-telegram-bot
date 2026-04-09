@@ -12,9 +12,15 @@ from tgboter.config import UserSessionState
 class SessionStore:
     """Manage in-memory sessions with optional JSON persistence."""
 
-    def __init__(self, storage_path: str, default_language: str = "zh") -> None:
+    def __init__(
+        self,
+        storage_path: str,
+        default_language: str = "zh",
+        default_project_path: str = ".",
+    ) -> None:
         self.storage_path = Path(storage_path)
         self._default_language = default_language
+        self._default_project_path = str(Path(default_project_path).expanduser().resolve())
         self._lock = asyncio.Lock()
         self._users: dict[int, UserSessionState] = {}
         self._load()
@@ -29,10 +35,26 @@ class SessionStore:
 
         users: dict[int, UserSessionState] = {}
         for user_id_str, state in payload.items():
+            raw_backend_sessions = state.get("backend_sessions", {})
+            backend_sessions: dict[str, dict[str, str]] = {}
+            for session_id, value in raw_backend_sessions.items():
+                if isinstance(value, dict):
+                    backend_sessions[session_id] = {
+                        str(name): str(backend_id)
+                        for name, backend_id in value.items()
+                        if str(name).strip() and str(backend_id).strip()
+                    }
+                elif isinstance(value, str) and value.strip():
+                    backend_sessions[session_id] = {"codex": value}
             users[int(user_id_str)] = UserSessionState(
                 current_session=state.get("current_session"),
                 sessions=state.get("sessions", {}),
-                backend_sessions=state.get("backend_sessions", {}),
+                backend_sessions=backend_sessions,
+                session_project_paths={
+                    str(session_id): str(project_path)
+                    for session_id, project_path in state.get("session_project_paths", {}).items()
+                    if str(session_id).strip() and str(project_path).strip()
+                },
                 language=state.get("language", self._default_language),
             )
         self._users = users
@@ -54,6 +76,7 @@ class SessionStore:
                 session_id = self._new_session_id()
                 state.current_session = session_id
                 state.sessions[session_id] = []
+                state.session_project_paths[session_id] = self._default_project_path
                 await self._save()
             return state
 
@@ -63,6 +86,7 @@ class SessionStore:
             state = self._users.setdefault(user_id, UserSessionState(language=self._default_language))
             session_id = self._new_session_id()
             state.sessions[session_id] = []
+            state.session_project_paths[session_id] = self._default_project_path
             state.current_session = session_id
             await self._save()
             return session_id
@@ -94,6 +118,7 @@ class SessionStore:
             state = self._users.setdefault(user_id, UserSessionState(language=self._default_language))
             if not state.current_session:
                 state.current_session = self._new_session_id()
+            state.session_project_paths.setdefault(state.current_session, self._default_project_path)
             state.sessions[state.current_session] = []
             state.backend_sessions.pop(state.current_session, None)
             await self._save()
@@ -126,9 +151,11 @@ class SessionStore:
             if not state.current_session:
                 state.current_session = self._new_session_id()
                 state.sessions[state.current_session] = []
+                state.session_project_paths[state.current_session] = self._default_project_path
 
             selected_session = session_id or state.current_session
             state.sessions.setdefault(selected_session, []).append({"role": role, "content": content})
+            state.session_project_paths.setdefault(selected_session, self._default_project_path)
             await self._save()
             return selected_session
 
@@ -136,17 +163,23 @@ class SessionStore:
         """Return the full state for a user."""
         return await self.ensure_user(user_id)
 
-    async def get_backend_session_id(self, user_id: int, session_id: str | None = None) -> str | None:
+    async def get_backend_session_id(
+        self,
+        user_id: int,
+        backend_name: str,
+        session_id: str | None = None,
+    ) -> str | None:
         """Return the backend session id mapped to a Telegram session."""
         state = await self.ensure_user(user_id)
         selected_session = session_id or state.current_session
         if not selected_session:
             return None
-        return state.backend_sessions.get(selected_session)
+        return state.backend_sessions.get(selected_session, {}).get(backend_name)
 
     async def set_backend_session_id(
         self,
         user_id: int,
+        backend_name: str,
         backend_session_id: str,
         session_id: str | None = None,
     ) -> None:
@@ -156,10 +189,37 @@ class SessionStore:
             if not state.current_session:
                 state.current_session = self._new_session_id()
                 state.sessions[state.current_session] = []
+                state.session_project_paths[state.current_session] = self._default_project_path
 
             selected_session = session_id or state.current_session
             state.sessions.setdefault(selected_session, [])
-            state.backend_sessions[selected_session] = backend_session_id
+            state.session_project_paths.setdefault(selected_session, self._default_project_path)
+            state.backend_sessions.setdefault(selected_session, {})[backend_name] = backend_session_id
+            await self._save()
+
+    async def get_project_path(self, user_id: int, session_id: str | None = None) -> str:
+        """Return the project path bound to a session."""
+        state = await self.ensure_user(user_id)
+        selected_session = session_id or state.current_session
+        if not selected_session:
+            return self._default_project_path
+        return state.session_project_paths.get(selected_session, self._default_project_path)
+
+    async def set_project_path(
+        self,
+        user_id: int,
+        project_path: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Persist the project path bound to a session."""
+        async with self._lock:
+            state = self._users.setdefault(user_id, UserSessionState(language=self._default_language))
+            if not state.current_session:
+                state.current_session = self._new_session_id()
+                state.sessions[state.current_session] = []
+            selected_session = session_id or state.current_session
+            state.sessions.setdefault(selected_session, [])
+            state.session_project_paths[selected_session] = str(Path(project_path).expanduser().resolve())
             await self._save()
 
     async def get_language(self, user_id: int) -> str:

@@ -68,7 +68,11 @@ async def async_main() -> None:
     instance_lock = SingleInstanceLock(lock_path())
     if not instance_lock.acquire():
         return
-    store = SessionStore(config.session_store_path, default_language=config.default_language)
+    store = SessionStore(
+        config.session_store_path,
+        default_language=config.default_language,
+        default_project_path=config.project_path,
+    )
     codex_client = CodexClient(config)
     usage_client = OpenAIUsageClient(config)
     bot = TelegramCodexBot(config, store, codex_client, usage_client)

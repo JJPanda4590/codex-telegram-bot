@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import os
 import secrets
+import shlex
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -80,7 +82,7 @@ class TelegramCodexBot:
         self.codex_client = codex_client
         self.usage_client = usage_client
         self.i18n = I18n(config.translations_path, default_language=config.default_language)
-        self.project_path = Path(config.project_path).resolve()
+        self.default_project_path = Path(config.project_path).resolve()
         self._started_monotonic = time.monotonic()
         self._active_requests_lock = asyncio.Lock()
         self._active_requests: set[asyncio.Task[None]] = set()
@@ -339,9 +341,15 @@ class TelegramCodexBot:
             return
         assert update.effective_user is not None
         language = await self._user_language(update.effective_user.id)
+        project_path = await self._current_project_path(update.effective_user.id)
         text, reply_markup, parse_mode = self._file_browser_disabled_view(language)
         if self.config.file_browser_enabled:
-            view = self._build_directory_browser_view(self.project_path, language=language, page=0)
+            view = self._build_directory_browser_view(
+                project_path,
+                current_project_path=project_path,
+                language=language,
+                page=0,
+            )
             text, reply_markup, parse_mode = view
         await self._safe_reply(update, text, parse_mode=parse_mode, reply_markup=reply_markup)
 
@@ -363,11 +371,13 @@ class TelegramCodexBot:
             return
         assert update.effective_user is not None
         language = await self._user_language(update.effective_user.id)
+        project_path = await self._current_project_path(update.effective_user.id)
 
         if not context.args:
-            selector_root = self.project_path.parent if self.project_path.parent != self.project_path else self.project_path
+            selector_root = project_path.parent if project_path.parent != project_path else project_path
             text, reply_markup, parse_mode = self._build_project_selector_view(
                 selector_root,
+                current_project_path=project_path,
                 language=language,
                 page=0,
             )
@@ -376,7 +386,7 @@ class TelegramCodexBot:
 
         requested_path = Path(" ".join(context.args)).expanduser()
         if not requested_path.is_absolute():
-            requested_path = (self.project_path / requested_path).resolve()
+            requested_path = (project_path / requested_path).resolve()
         await self._safe_reply(
             update,
             await self._switch_project_path(update.effective_user.id, requested_path, language=language),
@@ -403,6 +413,7 @@ class TelegramCodexBot:
             return
 
         session_id = await self.store.get_current_session_id(user.id)
+        project_path = await self._current_project_path(user.id, session_id=session_id)
         await self.store.append_message(user.id, "user", user_text, session_id=session_id)
         LOGGER.info("Forwarding message user_id=%s session_id=%s text=%s", user.id, session_id, user_text[:200])
 
@@ -427,7 +438,11 @@ class TelegramCodexBot:
             await self._register_active_request(current_task)
 
         try:
-            backend_session_id = await self.store.get_backend_session_id(user.id, session_id=session_id)
+            backend_session_id = await self.store.get_backend_session_id(
+                user.id,
+                self.config.active_cli,
+                session_id=session_id,
+            )
             started_at = time.perf_counter()
 
             async def on_event(event: CodexStreamEvent) -> None:
@@ -445,10 +460,17 @@ class TelegramCodexBot:
                     return
                 if event.kind == "tool_completed":
                     await self._send_tool_event_message(update, stream_state, event, started=False)
+                    return
+                if event.kind == "file_change_started":
+                    await self._send_file_change_event_message(update, stream_state, event, started=True)
+                    return
+                if event.kind == "file_change_completed":
+                    await self._send_file_change_event_message(update, stream_state, event, started=False)
 
             result = await asyncio.wait_for(
                 self.codex_client.send_message(
                     user_text,
+                    project_path=project_path,
                     backend_session_id=backend_session_id,
                     on_event=on_event,
                 ),
@@ -476,6 +498,7 @@ class TelegramCodexBot:
             if result.backend_session_id:
                 await self.store.set_backend_session_id(
                     user.id,
+                    self.config.active_cli,
                     result.backend_session_id,
                     session_id=session_id,
                 )
@@ -590,6 +613,7 @@ class TelegramCodexBot:
             return
 
         if data == "view:files":
+            project_path = await self._current_project_path(user.id)
             if not self.config.file_browser_enabled:
                 text, reply_markup, parse_mode = self._file_browser_disabled_view(language)
                 await self._safe_edit_text(
@@ -600,7 +624,8 @@ class TelegramCodexBot:
                 )
                 return
             text, reply_markup, parse_mode = self._build_directory_browser_view(
-                self.project_path,
+                project_path,
+                current_project_path=project_path,
                 language=language,
                 page=0,
             )
@@ -613,9 +638,11 @@ class TelegramCodexBot:
             return
 
         if data == "view:project":
-            selector_root = self.project_path.parent if self.project_path.parent != self.project_path else self.project_path
+            project_path = await self._current_project_path(user.id)
+            selector_root = project_path.parent if project_path.parent != project_path else project_path
             text, reply_markup, parse_mode = self._build_project_selector_view(
                 selector_root,
+                current_project_path=project_path,
                 language=language,
                 page=0,
             )
@@ -650,6 +677,15 @@ class TelegramCodexBot:
             )
             return
 
+        if data in {"selector:cli", "view:cli"}:
+            await self._safe_edit_text(
+                query.message,
+                await self._status_text(user.id, extra=self._t("message.select_cli", language=language)),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._build_selector_keyboard(language=language, mode="cli"),
+            )
+            return
+
         if data in {"selector:reasoning", "view:reasoning"}:
             await self._safe_edit_text(
                 query.message,
@@ -681,6 +717,36 @@ class TelegramCodexBot:
                 ),
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=self._build_selector_keyboard(language=language, mode="status"),
+            )
+            return
+
+        if data.startswith("set:cli:"):
+            cli_name = data.removeprefix("set:cli:")
+            if cli_name not in self.config.supported_cli_names():
+                await query.answer(self._t("callback.invalid_cli", language=language), show_alert=True)
+                return
+            try:
+                self.config.activate_cli(cli_name)
+                self.config.save()
+            except ValueError as exc:
+                await query.answer(
+                    self._t("message.cli_unavailable", language=language, cli_name=self.config.cli_display_name(cli_name), error=exc),
+                    show_alert=True,
+                )
+                return
+            LOGGER.info("CLI backend changed by user_id=%s cli=%s", user.id, cli_name)
+            await self._safe_edit_text(
+                query.message,
+                await self._help_text(
+                    user.id,
+                    extra=self._t(
+                        "message.cli_switched",
+                        language=language,
+                        cli_name=self.config.cli_display_name(cli_name),
+                    ),
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._build_selector_keyboard(language=language, mode="help"),
             )
             return
 
@@ -730,6 +796,7 @@ class TelegramCodexBot:
                 return
             text, reply_markup, parse_mode = self._build_directory_browser_view(
                 path,
+                current_project_path=await self._current_project_path(user.id),
                 language=language,
                 page=page,
             )
@@ -746,7 +813,11 @@ class TelegramCodexBot:
             if path is None:
                 await query.answer(self._t("files.invalid_target", language=language), show_alert=True)
                 return
-            text, reply_markup, parse_mode = self._build_file_preview_view(path, language=language)
+            text, reply_markup, parse_mode = self._build_file_preview_view(
+                path,
+                current_project_path=await self._current_project_path(user.id),
+                language=language,
+            )
             await self._safe_edit_text(
                 query.message,
                 text,
@@ -762,6 +833,7 @@ class TelegramCodexBot:
                 return
             text, reply_markup, parse_mode = self._build_project_selector_view(
                 path,
+                current_project_path=await self._current_project_path(user.id),
                 language=language,
                 page=page,
             )
@@ -875,6 +947,11 @@ class TelegramCodexBot:
                 self._t("help.current_title", language=language, title=current_title),
                 self._t("help.session_count", language=language, count=len(state.sessions)),
                 self._t(
+                    "help.current_cli",
+                    language=language,
+                    cli_name=self.config.cli_display_name(self.config.active_cli),
+                ),
+                self._t(
                     "help.current_language",
                     language=language,
                     language_name=self._language_name(language, display_language=language),
@@ -886,6 +963,7 @@ class TelegramCodexBot:
                 self._t("help.action.session_details", language=language),
                 self._t("help.action.project", language=language),
                 self._t("help.action.file_browser", language=language),
+                self._t("help.action.cli", language=language),
                 self._t("help.action.stop", language=language),
                 self._t("help.action.restart", language=language),
                 "",
@@ -905,12 +983,16 @@ class TelegramCodexBot:
         state = await self.store.get_user_state(user_id)
         language = self.i18n.normalize_language(state.language)
         current_session_id = state.current_session or ""
+        current_project_path = await self._current_project_path(user_id, session_id=current_session_id)
         current_messages = state.sessions.get(current_session_id, [])
-        backend_session_id = state.backend_sessions.get(current_session_id)
+        backend_session_id = state.backend_sessions.get(current_session_id, {}).get(self.config.active_cli)
         total_messages = sum(len(messages) for messages in state.sessions.values())
         current_user_messages = sum(1 for message in current_messages if message.get("role") == "user")
         current_assistant_messages = sum(1 for message in current_messages if message.get("role") == "assistant")
         active_requests = await self._active_request_count()
+        bound_sessions = sum(
+            1 for mapping in state.backend_sessions.values() if self.config.active_cli in mapping
+        )
         titled_sessions = sum(
             1
             for messages in state.sessions.values()
@@ -923,9 +1005,14 @@ class TelegramCodexBot:
         parts.extend(
             [
                 self._t("status.runtime", language=language),
+                self._t(
+                    "status.cli",
+                    language=language,
+                    cli_name=self.config.cli_display_name(self.config.active_cli),
+                ),
                 self._t("status.model", language=language, model=self.config.codex_model),
                 self._t("status.reasoning", language=language, effort=self.config.codex_reasoning_effort),
-                self._t("status.project_path", language=language, path=self.project_path),
+                self._t("status.project_path", language=language, path=current_project_path),
                 self._t(
                     "status.file_browser",
                     language=language,
@@ -963,7 +1050,7 @@ class TelegramCodexBot:
                 "",
                 self._t("status.all_sessions", language=language),
                 self._t("status.total_sessions", language=language, count=len(state.sessions)),
-                self._t("status.bound_sessions", language=language, count=len(state.backend_sessions)),
+                self._t("status.bound_sessions", language=language, count=bound_sessions),
                 self._t("status.titled_sessions", language=language, count=titled_sessions),
                 self._t("status.total_messages", language=language, count=total_messages),
                 "",
@@ -1059,8 +1146,8 @@ class TelegramCodexBot:
             marker = self._t("session.list.current_marker", language=language) if session_id == state.current_session else ""
             title = self._session_title(messages, language=language)
             if detailed:
-                backend_session_id = state.backend_sessions.get(
-                    session_id,
+                backend_session_id = state.backend_sessions.get(session_id, {}).get(
+                    self.config.active_cli,
                     self._t("session.new_thread", language=language),
                 )
                 lines.append(
@@ -1090,6 +1177,10 @@ class TelegramCodexBot:
         """Return the number of in-flight user requests."""
         async with self._active_requests_lock:
             return sum(1 for task in self._active_requests if not task.done())
+
+    async def _current_project_path(self, user_id: int, session_id: str | None = None) -> Path:
+        """Resolve the project path bound to the selected session."""
+        return Path(await self.store.get_project_path(user_id, session_id=session_id)).resolve()
 
     def _format_uptime(self, language: str) -> str:
         """Render process uptime as a short human-readable duration."""
@@ -1143,7 +1234,10 @@ class TelegramCodexBot:
         lines: list[str] = []
         for session_id, messages in reversed(session_items):
             marker = self._t("session.list.current_marker", language=language) if session_id == state.current_session else ""
-            backend_session_id = state.backend_sessions.get(session_id, self._t("session.new_thread", language=language))
+            backend_session_id = state.backend_sessions.get(session_id, {}).get(
+                self.config.active_cli,
+                self._t("session.new_thread", language=language),
+            )
             lines.append(
                 f"- `{session_id}`{marker} | {self._session_title(messages, language=language)} | "
                 f"messages=`{len(messages)}` | thread=`{backend_session_id}`"
@@ -1183,6 +1277,16 @@ class TelegramCodexBot:
         """Build distinct keyboards for help, status, and config selection."""
         if mode == "models":
             rows = self._build_model_rows()
+            rows.append(
+                [
+                    InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
+                    InlineKeyboardButton(self._t("keyboard.help", language=language), callback_data="view:help"),
+                ]
+            )
+            return InlineKeyboardMarkup(rows)
+
+        if mode == "cli":
+            rows = self._build_cli_rows(language)
             rows.append(
                 [
                     InlineKeyboardButton(self._t("keyboard.back_status", language=language), callback_data="view:status"),
@@ -1233,14 +1337,15 @@ class TelegramCodexBot:
                         InlineKeyboardButton(self._t("keyboard.token_usage", language=language), callback_data="view:token"),
                     ],
                     [
+                        InlineKeyboardButton(self._t("keyboard.cli", language=language), callback_data="view:cli"),
                         InlineKeyboardButton(self._t("keyboard.models", language=language), callback_data="view:models"),
+                    ],
+                    [
                         InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
-                    ],
-                    [
                         InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
-                        InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
                     ],
                     [
+                        InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
                         InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
                     ],
                 ]
@@ -1257,12 +1362,16 @@ class TelegramCodexBot:
                     InlineKeyboardButton(self._t("keyboard.token_usage", language=language), callback_data="view:token"),
                 ],
                 [
+                    InlineKeyboardButton(self._t("keyboard.cli", language=language), callback_data="view:cli"),
                     InlineKeyboardButton(self._t("keyboard.models", language=language), callback_data="view:models"),
-                    InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                 ],
                 [
+                    InlineKeyboardButton(self._t("keyboard.reasoning", language=language), callback_data="view:reasoning"),
                     InlineKeyboardButton(self._t("keyboard.project", language=language), callback_data="view:project"),
+                ],
+                [
                     InlineKeyboardButton(self._file_browser_button_text(language), callback_data="view:files"),
+                    InlineKeyboardButton(self._t("keyboard.language", language=language), callback_data="view:language"),
                 ],
             ]
         )
@@ -1297,19 +1406,25 @@ class TelegramCodexBot:
         self,
         path: Path,
         *,
+        current_project_path: Path,
         language: str,
         page: int,
     ) -> tuple[str, InlineKeyboardMarkup, str | None]:
         """Render a browsable directory listing with folder/file buttons."""
         resolved = path.expanduser().resolve()
-        if not self.project_path.exists():
-            text = self._t("files.root_missing", language=language, path=self.project_path)
+        current_project_path = current_project_path.expanduser().resolve()
+        if not current_project_path.exists():
+            text = self._t("files.root_missing", language=language, path=current_project_path)
             return text, self._file_browser_footer(language), ParseMode.MARKDOWN
         if not resolved.exists():
             text = self._t("files.path_missing", language=language, path=resolved)
             return text, self._file_browser_footer(language), ParseMode.MARKDOWN
         if not resolved.is_dir():
-            return self._build_file_preview_view(resolved, language=language)
+            return self._build_file_preview_view(
+                resolved,
+                current_project_path=current_project_path,
+                language=language,
+            )
 
         try:
             entries = sorted(
@@ -1331,7 +1446,7 @@ class TelegramCodexBot:
                 "files.dir.summary",
                 language=language,
                 path=resolved,
-                project_path=self.project_path,
+                project_path=current_project_path,
                 page=current_page + 1,
                 total_pages=total_pages,
                 count=len(entries),
@@ -1387,15 +1502,22 @@ class TelegramCodexBot:
         self,
         path: Path,
         *,
+        current_project_path: Path | None = None,
         language: str,
     ) -> tuple[str, InlineKeyboardMarkup, str | None]:
         """Render a file preview and a back button to the parent directory."""
         resolved = path.expanduser().resolve()
+        current_project_path = (current_project_path or self.default_project_path).expanduser().resolve()
         if not resolved.exists():
             text = self._t("files.path_missing", language=language, path=resolved)
             return text, self._file_browser_footer(language), ParseMode.MARKDOWN
         if resolved.is_dir():
-            return self._build_directory_browser_view(resolved, language=language, page=0)
+            return self._build_directory_browser_view(
+                resolved,
+                current_project_path=current_project_path,
+                language=language,
+                page=0,
+            )
 
         content = self._read_file_preview_content(resolved, language=language)
         text = self._fit_telegram_text(
@@ -1416,11 +1538,13 @@ class TelegramCodexBot:
         self,
         path: Path,
         *,
+        current_project_path: Path,
         language: str,
         page: int,
     ) -> tuple[str, InlineKeyboardMarkup, str | None]:
         """Render a directory-only browser used to switch the active project path."""
         resolved = path.expanduser().resolve()
+        current_project_path = current_project_path.expanduser().resolve()
         if not resolved.exists():
             text = self._t("message.project_missing", language=language, path=resolved)
             return text, self._project_selector_footer(language), ParseMode.MARKDOWN
@@ -1447,7 +1571,7 @@ class TelegramCodexBot:
             text = self._t(
                 "project.selector.summary",
                 language=language,
-                current_path=self.project_path,
+                current_path=current_project_path,
                 path=resolved,
                 page=current_page + 1,
                 total_pages=total_pages,
@@ -1457,7 +1581,7 @@ class TelegramCodexBot:
             text = self._t(
                 "project.selector.empty",
                 language=language,
-                current_path=self.project_path,
+                current_path=current_project_path,
                 path=resolved,
             )
 
@@ -1602,6 +1726,21 @@ class TelegramCodexBot:
             rows.append(buttons)
         return rows
 
+    def _build_cli_rows(self, language: str) -> list[list[InlineKeyboardButton]]:
+        """Build buttons for supported CLI backends."""
+        rows: list[list[InlineKeyboardButton]] = []
+        for cli_name in self.config.supported_cli_names():
+            label = f"{'• ' if cli_name == self.config.active_cli else ''}{self.config.cli_display_name(cli_name)}"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        self._trim_button_label(label, limit=32),
+                        callback_data=f"set:cli:{cli_name}",
+                    )
+                ]
+            )
+        return rows
+
     def _build_reasoning_rows(self) -> list[list[InlineKeyboardButton]]:
         """Build buttons for reasoning effort options."""
         rows: list[list[InlineKeyboardButton]] = []
@@ -1638,22 +1777,19 @@ class TelegramCodexBot:
         return models[:8]
 
     async def _switch_project_path(self, user_id: int, requested_path: Path, *, language: str) -> str:
-        """Validate and switch the active project path, resetting the user's current session."""
+        """Validate and switch the current session project path, resetting only that session."""
         resolved = requested_path.expanduser().resolve()
         if not resolved.exists():
             return self._t("message.project_missing", language=language, path=resolved)
         if not resolved.is_dir():
             return self._t("message.project_not_dir", language=language, path=resolved)
-        if resolved == self.project_path:
+        current_project_path = await self._current_project_path(user_id)
+        if resolved == current_project_path:
             return self._t("message.project_current", language=language, path=resolved)
 
-        self.project_path = resolved
-        self.config.project_path = str(resolved)
-        self.codex_client.set_project_path(resolved)
-        self.config.save()
-
+        await self.store.set_project_path(user_id, str(resolved))
         session_id = await self.store.reset_current_session(user_id)
-        LOGGER.info("Switched project path to %s and reset session=%s", resolved, session_id)
+        LOGGER.info("Switched project path user_id=%s session_id=%s path=%s", user_id, session_id, resolved)
         return self._t(
             "message.project_switched",
             language=language,
@@ -1843,7 +1979,7 @@ class TelegramCodexBot:
         if chat is not None:
             await self._send_chat_action(chat.id, action)
         if started:
-            text = self._render_tool_event_text("🛠", command_summary, language=language)
+            text = self._render_tool_event_text("⏳", command, command_summary, language=language)
             sent_message = await self._safe_reply_message(update, text, parse_mode=ParseMode.MARKDOWN)
             if sent_message is not None and event.item_id:
                 tool_messages[event.item_id] = sent_message
@@ -1851,20 +1987,65 @@ class TelegramCodexBot:
             return
 
         if event.exit_code == 0:
-            text = self._render_tool_event_text("✅", command_summary, language=language)
+            text = self._render_tool_event_text("✅", command, command_summary, language=language)
         else:
             failure_reason = self._summarize_tool_failure(
                 event.output,
                 event.exit_code,
                 language=language,
             )
-            text = self._render_tool_event_text("❌", command_summary, language=language, detail=failure_reason)
+            text = self._render_tool_event_text("❌", command, command_summary, language=language, detail=failure_reason)
         self._set_stream_chat_action(state, ChatAction.TYPING)
 
         tool_message = tool_messages.pop(event.item_id, None) if event.item_id else None
         if tool_message is not None:
             edited = await self._safe_edit_text(
                 tool_message,
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                allow_plain_fallback=False,
+            )
+            if edited:
+                self._start_new_stream_segment(state)
+                return
+
+        await self._safe_reply_message(update, text, parse_mode=ParseMode.MARKDOWN)
+        self._start_new_stream_segment(state)
+
+    async def _send_file_change_event_message(
+        self,
+        update: Update,
+        state: dict[str, object],
+        event: CodexStreamEvent,
+        *,
+        started: bool,
+    ) -> None:
+        """Send Telegram status updates for file edits and include a compact change summary."""
+        language = str(state.get("language") or self.config.default_language)
+        file_messages = self._file_change_messages(state)
+        snapshots = self._file_change_snapshots(state)
+        changes = self._normalize_file_changes(event.changes)
+        summary = self._summarize_file_change_paths(changes, language=language)
+        if started:
+            if event.item_id:
+                snapshots[event.item_id] = self._capture_file_change_snapshot(changes)
+            text = self._render_file_change_event_text("⏳", summary, language=language)
+            sent_message = await self._safe_reply_message(update, text, parse_mode=ParseMode.MARKDOWN)
+            if sent_message is not None and event.item_id:
+                file_messages[event.item_id] = sent_message
+            self._start_new_stream_segment(state)
+            return
+
+        detail = self._summarize_file_change_result(
+            changes,
+            snapshots.pop(event.item_id, None) if event.item_id else None,
+            language=language,
+        )
+        text = self._render_file_change_event_text("✅", summary, language=language, detail=detail)
+        file_message = file_messages.pop(event.item_id, None) if event.item_id else None
+        if file_message is not None:
+            edited = await self._safe_edit_text(
+                file_message,
                 text,
                 parse_mode=ParseMode.MARKDOWN,
                 allow_plain_fallback=False,
@@ -1942,11 +2123,13 @@ class TelegramCodexBot:
         previous_content = previous_preview.removesuffix(self._t("stream.preview_suffix", language=language))
         if preview == previous_preview:
             return
+        min_interval = self.config.stream_update_min_interval_seconds
+        min_chars = self.config.stream_update_min_chars
         if (
-            now - float(state["last_sent_at"]) < 1.0
+            now - float(state["last_sent_at"]) < min_interval
             and previous_content
             and preview.startswith(previous_content)
-            and len(preview) - len(previous_preview) < 80
+            and len(preview) - len(previous_preview) < min_chars
         ):
             return
 
@@ -2112,6 +2295,26 @@ class TelegramCodexBot:
         return tool_messages
 
     @staticmethod
+    def _file_change_messages(state: dict[str, object]) -> dict[str, object]:
+        """Return the mutable map of pending file-change Telegram messages keyed by item id."""
+        file_messages = state.get("file_change_messages")
+        if isinstance(file_messages, dict):
+            return file_messages
+        file_messages = {}
+        state["file_change_messages"] = file_messages
+        return file_messages
+
+    @staticmethod
+    def _file_change_snapshots(state: dict[str, object]) -> dict[str, object]:
+        """Return the mutable map of pre-edit snapshots keyed by file-change item id."""
+        snapshots = state.get("file_change_snapshots")
+        if isinstance(snapshots, dict):
+            return snapshots
+        snapshots = {}
+        state["file_change_snapshots"] = snapshots
+        return snapshots
+
+    @staticmethod
     def _stream_chat_action(state: dict[str, object]) -> str:
         """Return the currently selected Telegram activity indicator."""
         action = state.get("chat_action")
@@ -2171,15 +2374,59 @@ class TelegramCodexBot:
 
         token_parts: list[str] = []
         if usage.total_tokens is not None:
-            token_parts.append(self._t("completion.total_tokens", language=language, count=f"{usage.total_tokens:,}"))
+            token_parts.append(
+                self._t(
+                    "completion.total_tokens",
+                    language=language,
+                    count=self._format_compact_number(usage.total_tokens),
+                    raw=f"{usage.total_tokens:,}",
+                )
+            )
         if usage.input_tokens is not None:
-            token_parts.append(self._t("completion.input_tokens", language=language, count=f"{usage.input_tokens:,}"))
+            token_parts.append(
+                self._t(
+                    "completion.input_tokens",
+                    language=language,
+                    count=self._format_compact_number(usage.input_tokens),
+                    raw=f"{usage.input_tokens:,}",
+                )
+            )
         if usage.output_tokens is not None:
-            token_parts.append(self._t("completion.output_tokens", language=language, count=f"{usage.output_tokens:,}"))
+            token_parts.append(
+                self._t(
+                    "completion.output_tokens",
+                    language=language,
+                    count=self._format_compact_number(usage.output_tokens),
+                    raw=f"{usage.output_tokens:,}",
+                )
+            )
         if not token_parts:
             return self._t("completion.token_unavailable", language=language, summary=summary)
         token_joiner = "，" if language == "zh" else ", "
         return self._t("completion.with_tokens", language=language, summary=summary, tokens=token_joiner.join(token_parts))
+
+    @staticmethod
+    def _format_compact_number(value: int) -> str:
+        """Render large integers using compact k/m/b suffixes."""
+        abs_value = abs(value)
+        thresholds = (
+            (1_000_000_000, "b"),
+            (1_000_000, "m"),
+            (1_000, "k"),
+        )
+        for threshold, suffix in thresholds:
+            if abs_value < threshold:
+                continue
+            compact = value / threshold
+            if abs(compact) >= 100:
+                rendered = f"{compact:.0f}"
+            elif abs(compact) >= 10:
+                rendered = f"{compact:.1f}"
+            else:
+                rendered = f"{compact:.2f}"
+            rendered = rendered.rstrip("0").rstrip(".")
+            return f"{rendered}{suffix}"
+        return str(value)
 
     @staticmethod
     def _format_elapsed(elapsed_seconds: float) -> str:
@@ -2533,12 +2780,15 @@ class TelegramCodexBot:
     def _render_tool_event_text(
         self,
         emoji: str,
+        command: str,
         command_summary: str,
         language: str,
         detail: str | None = None,
     ) -> str:
         """Render a compact Telegram Markdown status message for tool updates."""
-        lines = [f"{emoji} {self._markdown_code(command_summary, limit=140)}"]
+        category = self._classify_tool_command(command)
+        title = self._tool_event_title(category, language=language)
+        lines = [f"{emoji} *{title}*", self._markdown_code(command_summary, limit=140)]
         if detail:
             lines.append(
                 self._t(
@@ -2547,6 +2797,19 @@ class TelegramCodexBot:
                     detail=self._markdown_code(detail, limit=120),
                 )
             )
+        return self._fit_telegram_text("\n".join(lines), 1000)
+
+    def _render_file_change_event_text(
+        self,
+        emoji: str,
+        summary: str,
+        language: str,
+        detail: str | None = None,
+    ) -> str:
+        """Render a compact Telegram Markdown status message for file edits."""
+        lines = [f"{emoji} *{self._t('tool.category.edit', language=language)}*", self._markdown_code(summary, limit=140)]
+        if detail:
+            lines.append(self._t("tool.summary", language=language, detail=self._markdown_code(detail, limit=120)))
         return self._fit_telegram_text("\n".join(lines), 1000)
 
     @staticmethod
@@ -2578,6 +2841,360 @@ class TelegramCodexBot:
         if exit_code is not None:
             return self._t("tool.exit_code", language=language, exit_code=exit_code)
         return self._t("tool.unknown_error", language=language)
+
+    @staticmethod
+    def _classify_tool_command(command: str) -> str:
+        """Classify a shell command into a small set of UI-facing categories."""
+        normalized = f" {command.lower()} "
+        normalized_symbols = TelegramCodexBot._normalize_tool_command_symbols(normalized)
+        tokens = TelegramCodexBot._extract_tool_command_tokens(command)
+        primary = TelegramCodexBot._command_executable_name(tokens[0]) if tokens else ""
+        secondary = tokens[1] if len(tokens) > 1 else ""
+
+        if primary in {"rg", "grep", "ag", "ack"} or (primary == "git" and secondary == "grep"):
+            return "search"
+        if primary in {"cat", "head", "tail", "less", "more", "awk", "find", "ls", "open", "click"}:
+            return "read"
+        if primary == "sed" and "-n" in tokens:
+            return "read"
+        if primary == "find" and secondary in {"pattern", "text", "string"}:
+            return "search"
+        if primary in {"python", "pytest", "npm", "pnpm", "yarn", "make", "cargo", "uv"}:
+            return "run"
+        if primary == "go" and secondary == "test":
+            return "run"
+        if primary == "git" and secondary in {"diff", "show", "status", "log"}:
+            return "inspect"
+
+        if TelegramCodexBot._command_mentions_any(
+            normalized,
+            (
+                " rg ",
+                " rg --files ",
+                " grep ",
+                " git grep ",
+                " ag ",
+                " ack ",
+            ),
+        ) or TelegramCodexBot._command_mentions_any(
+            normalized_symbols,
+            (
+                " search ",
+                " search query ",
+                " find pattern ",
+                " find text ",
+                " find string ",
+                " search code ",
+                " grep file ",
+                " grep path ",
+            ),
+        ):
+            return "search"
+        if (
+            TelegramCodexBot._command_mentions_any(
+                normalized,
+                (
+                    " cat ",
+                    " sed ",
+                    " sed -n ",
+                    " head ",
+                    " tail ",
+                    " less ",
+                    " more ",
+                    " grep ",
+                    " awk ",
+                    " find ",
+                    " ls ",
+                    " open ",
+                    " click ",
+                    " find(",
+                    " screenshot ",
+                    " read_mcp_resource ",
+                    " github_fetch ",
+                    " github_fetch_file ",
+                    " github_fetch_blob ",
+                    " github_fetch_pr ",
+                    " github_fetch_pr_patch ",
+                    " github_fetch_pr_file_patch ",
+                    " github_get_pr_diff ",
+                    " github_search ",
+                ),
+            )
+            or TelegramCodexBot._command_mentions_any(
+                normalized_symbols,
+                (
+                    " open_file ",
+                    " read_file ",
+                    " view_file ",
+                    " show_file ",
+                    " read_path ",
+                    " open_path ",
+                    " file_read ",
+                    " file_open ",
+                    " read_resource ",
+                    " open_resource ",
+                    " fetch_file ",
+                    " fetch_blob ",
+                    " fetch_patch ",
+                    " fetch_diff ",
+                    " read_source ",
+                    " source_read ",
+                ),
+            )
+            or TelegramCodexBot._looks_like_file_read_command(normalized_symbols)
+        ):
+            return "read"
+        if TelegramCodexBot._command_mentions_any(
+            normalized_symbols,
+            (" git diff ", " git show ", " git status ", " git log ", " diff ", " status ", " inspect "),
+        ):
+            return "inspect"
+        if TelegramCodexBot._command_mentions_any(
+            normalized_symbols,
+            (" python ", " pytest ", " npm ", " pnpm ", " yarn ", " make ", " cargo ", " go test ", " uv "),
+        ):
+            return "run"
+        return "tool"
+
+    def _tool_event_title(self, category: str, *, language: str) -> str:
+        """Return the localized UI title for a tool command category."""
+        key = {
+            "search": "tool.category.search",
+            "read": "tool.category.read",
+            "inspect": "tool.category.inspect",
+            "run": "tool.category.run",
+            "tool": "tool.category.tool",
+        }.get(category, "tool.category.tool")
+        return self._t(key, language=language)
+
+    @staticmethod
+    def _normalize_tool_command_symbols(command: str) -> str:
+        """Replace common tool-name separators with spaces for simpler matching."""
+        translation = str.maketrans({
+            "_": " ",
+            ".": " ",
+            ":": " ",
+            "(": " ",
+            ")": " ",
+            "[": " ",
+            "]": " ",
+            "{": " ",
+            "}": " ",
+            ",": " ",
+            "=": " ",
+            "\"": " ",
+            "'": " ",
+        })
+        normalized = command.translate(translation)
+        return f" {' '.join(normalized.split())} "
+
+    @staticmethod
+    def _extract_tool_command_tokens(command: str) -> tuple[str, ...]:
+        """Tokenize a tool command and unwrap simple shell launcher prefixes."""
+        tokens = TelegramCodexBot._tokenize_tool_command(command)
+        if not tokens:
+            return ()
+
+        shell_launchers = {
+            "sh",
+            "bash",
+            "zsh",
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+        }
+        current = tokens
+        while len(current) >= 3 and current[0] in shell_launchers and current[1] in {"-c", "-lc"}:
+            nested = TelegramCodexBot._tokenize_tool_command(current[2])
+            if not nested or nested == current:
+                break
+            current = nested
+        return current
+
+    @staticmethod
+    def _command_executable_name(token: str) -> str:
+        """Normalize an executable token to its basename for classification."""
+        stripped = token.strip().lower()
+        if not stripped:
+            return ""
+        candidate = Path(stripped).name
+        return candidate or stripped
+
+    @staticmethod
+    def _tokenize_tool_command(command: str) -> tuple[str, ...]:
+        """Split a shell-ish command into lowercase tokens."""
+        stripped = command.strip()
+        if not stripped:
+            return ()
+
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, list):
+            return tuple(str(part).strip().lower() for part in parsed if str(part).strip())
+
+        if isinstance(parsed, dict):
+            command_value = parsed.get("command") or parsed.get("cmd")
+            if isinstance(command_value, str):
+                return TelegramCodexBot._tokenize_tool_command(command_value)
+            args_value = parsed.get("args")
+            if isinstance(args_value, list):
+                return tuple(str(part).strip().lower() for part in args_value if str(part).strip())
+
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            parts = stripped.split()
+
+        return tuple(part.strip().lower() for part in parts if part.strip())
+
+    @staticmethod
+    def _looks_like_file_read_command(command: str) -> bool:
+        """Best-effort detection for tool calls that are clearly reading a file/path."""
+        read_verbs = (" read ", " open ", " view ", " show ", " fetch ", " print ", " display ")
+        file_nouns = (" file ", " path ", " source ", " code ", " contents ", " content ", " blob ")
+        likely_path_markers = (
+            "/",
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".json",
+            ".md",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".ini",
+            ".sh",
+            ".txt",
+        )
+        return (
+            TelegramCodexBot._command_mentions_any(command, read_verbs)
+            and (
+                TelegramCodexBot._command_mentions_any(command, file_nouns)
+                or any(marker in command for marker in likely_path_markers)
+            )
+        )
+
+    @staticmethod
+    def _normalize_file_changes(changes: list[dict[str, str]] | None) -> list[dict[str, str]]:
+        """Keep only file-change entries with a usable path."""
+        normalized: list[dict[str, str]] = []
+        if not changes:
+            return normalized
+        for change in changes:
+            path = str(change.get("path", "")).strip()
+            if not path:
+                continue
+            normalized.append({"path": path, "kind": str(change.get("kind", "update")).strip() or "update"})
+        return normalized
+
+    def _summarize_file_change_paths(self, changes: list[dict[str, str]], *, language: str) -> str:
+        """Render a compact one-line summary for file edits."""
+        if not changes:
+            return self._t("tool.edit.unknown_target", language=language)
+        names = [Path(change["path"]).name or change["path"] for change in changes[:3]]
+        if len(changes) == 1:
+            return names[0]
+        remaining = len(changes) - len(names)
+        joined = ", ".join(names)
+        if remaining > 0:
+            return self._t("tool.edit.targets_more", language=language, names=joined, remaining=remaining)
+        return joined
+
+    def _capture_file_change_snapshot(self, changes: list[dict[str, str]]) -> dict[str, dict[str, object]]:
+        """Capture file existence and text content before an edit starts."""
+        snapshot: dict[str, dict[str, object]] = {}
+        for change in changes:
+            path = Path(change["path"])
+            exists = path.exists()
+            content: str | None = None
+            if exists and path.is_file():
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    content = None
+            snapshot[change["path"]] = {"exists": exists, "content": content}
+        return snapshot
+
+    def _summarize_file_change_result(
+        self,
+        changes: list[dict[str, str]],
+        snapshot: object,
+        *,
+        language: str,
+    ) -> str:
+        """Build a human-readable edit summary including file count and added/removed lines."""
+        if not isinstance(snapshot, dict):
+            return self._t("tool.edit.completed", language=language, files=len(changes))
+
+        changed_files = 0
+        added_lines = 0
+        removed_lines = 0
+        for change in changes:
+            path_value = change["path"]
+            previous = snapshot.get(path_value)
+            if not isinstance(previous, dict):
+                continue
+            path = Path(path_value)
+            before_exists = bool(previous.get("exists"))
+            before_content = previous.get("content")
+            after_exists = path.exists()
+            after_content: str | None = None
+            if after_exists and path.is_file():
+                try:
+                    after_content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    after_content = None
+            file_added, file_removed = self._count_line_changes(
+                before_content if isinstance(before_content, str) else None,
+                after_content,
+                before_exists=before_exists,
+                after_exists=after_exists,
+            )
+            changed_files += 1
+            added_lines += file_added
+            removed_lines += file_removed
+
+        if changed_files == 0:
+            return self._t("tool.edit.completed", language=language, files=len(changes))
+        return self._t(
+            "tool.edit.summary",
+            language=language,
+            files=changed_files,
+            added=added_lines,
+            removed=removed_lines,
+        )
+
+    @staticmethod
+    def _count_line_changes(
+        before: str | None,
+        after: str | None,
+        *,
+        before_exists: bool,
+        after_exists: bool,
+    ) -> tuple[int, int]:
+        """Count added and removed lines between two text snapshots."""
+        if not before_exists and after_exists:
+            added = len(after.splitlines()) if after else 0
+            return added, 0
+        if before_exists and not after_exists:
+            removed = len(before.splitlines()) if before else 0
+            return 0, removed
+        before_lines = before.splitlines() if before else []
+        after_lines = after.splitlines() if after else []
+        matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines)
+        added = 0
+        removed = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in {"replace", "delete"}:
+                removed += i2 - i1
+            if tag in {"replace", "insert"}:
+                added += j2 - j1
+        return added, removed
 
     @staticmethod
     def _select_chat_action_for_command(command: str) -> str:

@@ -4,7 +4,7 @@ MIT License
 
 # Codex Telegram Command Center
 
-Version: `1.0.0`
+Version: `1.0.1`
 
 A production-oriented Telegram bot that forwards messages from authorized Telegram users to the local `codex` CLI and sends the response back to Telegram.
 
@@ -115,6 +115,8 @@ Important fields:
 - `codex_reasoning_effort`: one of `low`, `medium`, `high`, `xhigh`.
 - `project_path`: working directory used by `/project` and `/files`.
 - `session_store_path`: JSON file used to persist chat sessions.
+- `stream_update_min_interval_seconds`: minimum interval between streaming preview edits. Lower values feel smoother but increase Telegram edit frequency.
+- `stream_update_min_chars`: minimum newly added preview characters required to bypass the interval gate.
 - `default_language`: default bot UI language.
 - `translations_path`: i18n file path.
 - `openai_admin_api_key`: optional, enables `/usage`.

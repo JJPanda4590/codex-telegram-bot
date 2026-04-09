@@ -24,4 +24,4 @@ env/
 # Local runtime data
 .bot_restart.log
 sessions.json
-
+settings/bot_config.json

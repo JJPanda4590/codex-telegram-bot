@@ -4,7 +4,7 @@ MIT License
 
 # Codex Telegram Command Center
 
-版本：`1.0.0`
+版本：`1.0.1`
 
 这是一个偏生产可用的 Telegram 机器人项目：把白名单中的 Telegram 用户消息转发给本地 `codex` CLI，再把结果回传到 Telegram。
 
@@ -98,6 +98,8 @@ Telegram -> python-telegram-bot -> SessionStore -> local Codex CLI -> Telegram
   "openai_project_id": "",
   "session_store_path": "sessions.json",
   "request_timeout_seconds": 28800,
+  "stream_update_min_interval_seconds": 0.35,
+  "stream_update_min_chars": 24,
   "project_path": ".",
   "log_level": "INFO",
   "default_language": "zh",
@@ -115,6 +117,8 @@ Telegram -> python-telegram-bot -> SessionStore -> local Codex CLI -> Telegram
 - `codex_reasoning_effort`：可选 `low`、`medium`、`high`、`xhigh`。
 - `project_path`：`/project` 和 `/files` 使用的工作目录。
 - `session_store_path`：会话 JSON 持久化文件路径。
+- `stream_update_min_interval_seconds`：流式预览编辑的最小间隔。值越小，显示越顺滑，但 Telegram 消息编辑频率也越高。
+- `stream_update_min_chars`：在达到最小间隔前，预览新增多少字符后才允许跳过节流。
 - `default_language`：机器人默认界面语言。
 - `translations_path`：国际化文案文件路径。
 - `openai_admin_api_key`：可选，配置后可启用 `/usage`。

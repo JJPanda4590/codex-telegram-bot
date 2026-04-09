@@ -21,10 +21,15 @@ class Config:
 
     telegram_bot_token: str
     whitelist: list[int]
+    active_cli: str = "codex"
     codex_cli_path: str = "codex"
     codex_cli_fallback_paths: list[str] = field(default_factory=list)
+    google_antigravity_cli_path: str = "google-antigravity"
+    google_antigravity_cli_fallback_paths: list[str] = field(default_factory=list)
     codex_cli_use_shell: bool = False
+    google_antigravity_cli_use_shell: bool = False
     codex_shell_path: str = ""
+    google_antigravity_shell_path: str = ""
     codex_model: str = "gpt-4.1-mini"
     codex_reasoning_effort: str = "medium"
     openai_admin_api_key: str = ""
@@ -32,6 +37,8 @@ class Config:
     openai_project_id: str = ""
     session_store_path: str = "sessions.json"
     request_timeout_seconds: float = 28800.0
+    stream_update_min_interval_seconds: float = 0.35
+    stream_update_min_chars: int = 24
     project_path: str = "."
     file_browser_enabled: bool = False
     log_level: str = "INFO"
@@ -58,9 +65,16 @@ class Config:
         config = cls(
             telegram_bot_token=payload.get("telegram_bot_token", ""),
             whitelist=whitelist,
+            active_cli=str(payload.get("active_cli", "codex")).strip().lower() or "codex",
             codex_cli_path=str(payload.get("codex_cli_path") or "codex"),
             codex_cli_fallback_paths=[
                 str(item) for item in payload.get("codex_cli_fallback_paths", [])
+            ],
+            google_antigravity_cli_path=str(
+                payload.get("google_antigravity_cli_path") or "google-antigravity"
+            ),
+            google_antigravity_cli_fallback_paths=[
+                str(item) for item in payload.get("google_antigravity_cli_fallback_paths", [])
             ],
             codex_model=payload.get("codex_model", "gpt-4.1-mini"),
             codex_reasoning_effort=str(payload.get("codex_reasoning_effort", "medium")).lower(),
@@ -69,6 +83,10 @@ class Config:
             openai_project_id=str(payload.get("openai_project_id", "")),
             session_store_path=payload.get("session_store_path", "sessions.json"),
             request_timeout_seconds=float(payload.get("request_timeout_seconds", 28800.0)),
+            stream_update_min_interval_seconds=float(
+                payload.get("stream_update_min_interval_seconds", 0.35)
+            ),
+            stream_update_min_chars=int(payload.get("stream_update_min_chars", 24)),
             project_path=payload.get("project_path", "."),
             file_browser_enabled=bool(payload.get("file_browser_enabled", False)),
             log_level=str(payload.get("log_level", "INFO")).upper(),
@@ -83,8 +101,14 @@ class Config:
         """Validate required fields before startup."""
         if not self.telegram_bot_token:
             raise ValueError("'telegram_bot_token' is required")
+        if self.active_cli not in self.supported_cli_names():
+            raise ValueError("'active_cli' must be one of: " + ", ".join(self.supported_cli_names()))
         if self.request_timeout_seconds <= 0:
             raise ValueError("'request_timeout_seconds' must be > 0")
+        if self.stream_update_min_interval_seconds < 0:
+            raise ValueError("'stream_update_min_interval_seconds' must be >= 0")
+        if self.stream_update_min_chars < 0:
+            raise ValueError("'stream_update_min_chars' must be >= 0")
         if not self.codex_model:
             raise ValueError("'codex_model' is required")
         if self.default_language not in SUPPORTED_LANGUAGES:
@@ -96,20 +120,13 @@ class Config:
                 "'codex_reasoning_effort' must be one of: "
                 + ", ".join(SUPPORTED_REASONING_EFFORTS)
             )
-        if not isinstance(self.codex_cli_fallback_paths, list):
-            raise ValueError("'codex_cli_fallback_paths' must be a list of strings")
-        if not all(isinstance(path, str) and path.strip() for path in self.codex_cli_fallback_paths):
-            raise ValueError("'codex_cli_fallback_paths' must contain non-empty strings")
-        self.codex_cli_path = self.codex_cli_path.strip() or "codex"
-        resolved_path, use_shell = self._resolve_codex_cli_path()
-        if not resolved_path:
-            raise ValueError(
-                "Codex CLI not found. Checked: "
-                + ", ".join([self.codex_cli_path, *self.codex_cli_fallback_paths])
-            )
-        self.codex_cli_path = resolved_path
-        self.codex_cli_use_shell = use_shell
-        self.codex_shell_path = os.environ.get("SHELL", "/bin/sh")
+        self._validate_cli_config("codex", self.codex_cli_path, self.codex_cli_fallback_paths)
+        self._validate_cli_config(
+            "google-antigravity",
+            self.google_antigravity_cli_path,
+            self.google_antigravity_cli_fallback_paths,
+        )
+        self.activate_cli(self.active_cli)
 
     def save(self) -> None:
         """Persist the active configuration back to disk."""
@@ -119,8 +136,11 @@ class Config:
         payload = {
             "telegram_bot_token": self.telegram_bot_token,
             "whitelist": self.whitelist,
+            "active_cli": self.active_cli,
             "codex_cli_path": self.codex_cli_path,
             "codex_cli_fallback_paths": self.codex_cli_fallback_paths,
+            "google_antigravity_cli_path": self.google_antigravity_cli_path,
+            "google_antigravity_cli_fallback_paths": self.google_antigravity_cli_fallback_paths,
             "codex_model": self.codex_model,
             "codex_reasoning_effort": self.codex_reasoning_effort,
             "openai_admin_api_key": self.openai_admin_api_key,
@@ -128,6 +148,8 @@ class Config:
             "openai_project_id": self.openai_project_id,
             "session_store_path": self.session_store_path,
             "request_timeout_seconds": self.request_timeout_seconds,
+            "stream_update_min_interval_seconds": self.stream_update_min_interval_seconds,
+            "stream_update_min_chars": self.stream_update_min_chars,
             "project_path": self.project_path,
             "file_browser_enabled": self.file_browser_enabled,
             "log_level": self.log_level,
@@ -137,17 +159,45 @@ class Config:
         with self.config_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
 
-    def _resolve_codex_cli_path(self) -> tuple[str | None, bool]:
-        """Resolve the configured Codex CLI path or a configured fallback location."""
-        configured = Path(self.codex_cli_path).expanduser()
+    @staticmethod
+    def supported_cli_names() -> tuple[str, ...]:
+        """Return the supported CLI backends."""
+        return ("codex", "google-antigravity")
+
+    @staticmethod
+    def cli_display_name(cli_name: str) -> str:
+        """Return a user-facing backend name."""
+        return "Google Antigravity" if cli_name == "google-antigravity" else "Codex"
+
+    def activate_cli(self, cli_name: str) -> None:
+        """Resolve and activate the selected CLI backend."""
+        resolved_name = cli_name.strip().lower()
+        if resolved_name not in self.supported_cli_names():
+            raise ValueError(f"Unsupported CLI: {cli_name}")
+
+        resolved_path, use_shell = self.resolve_cli_path(resolved_name)
+        if not resolved_path:
+            configured, fallbacks = self._cli_locator_settings(resolved_name)
+            raise ValueError(
+                f"{self.cli_display_name(resolved_name)} CLI not found. Checked: "
+                + ", ".join([configured, *fallbacks])
+            )
+
+        self.active_cli = resolved_name
+        self._set_cli_runtime(resolved_name, resolved_path, use_shell)
+
+    def resolve_cli_path(self, cli_name: str) -> tuple[str | None, bool]:
+        """Resolve the configured CLI path or a configured fallback location."""
+        configured_name, fallback_paths = self._cli_locator_settings(cli_name)
+        configured = Path(configured_name).expanduser()
         if configured.is_file():
             return str(configured), False
 
-        discovered = shutil.which(self.codex_cli_path)
+        discovered = shutil.which(configured_name)
         if discovered:
             return discovered, False
 
-        for candidate in self.codex_cli_fallback_paths:
+        for candidate in fallback_paths:
             candidate_path = Path(candidate).expanduser()
             if candidate_path.is_file():
                 return str(candidate_path), False
@@ -155,10 +205,65 @@ class Config:
             if discovered:
                 return discovered, False
 
-        if self._is_available_in_login_shell(self.codex_cli_path):
-            return self.codex_cli_path, True
+        if self._is_available_in_login_shell(configured_name):
+            return configured_name, True
 
         return None, False
+
+    def cli_path(self) -> str:
+        """Return the resolved executable path for the active CLI."""
+        return (
+            self.google_antigravity_cli_path
+            if self.active_cli == "google-antigravity"
+            else self.codex_cli_path
+        )
+
+    def cli_use_shell(self) -> bool:
+        """Return whether the active CLI should be invoked via a login shell."""
+        return (
+            self.google_antigravity_cli_use_shell
+            if self.active_cli == "google-antigravity"
+            else self.codex_cli_use_shell
+        )
+
+    def cli_shell_path(self) -> str:
+        """Return the shell path for the active CLI."""
+        return (
+            self.google_antigravity_shell_path
+            if self.active_cli == "google-antigravity"
+            else self.codex_shell_path
+        )
+
+    def _cli_locator_settings(self, cli_name: str) -> tuple[str, list[str]]:
+        """Return the configured executable name and fallback list for a CLI."""
+        if cli_name == "google-antigravity":
+            return (
+                self.google_antigravity_cli_path.strip() or "google-antigravity",
+                self.google_antigravity_cli_fallback_paths,
+            )
+        return (self.codex_cli_path.strip() or "codex", self.codex_cli_fallback_paths)
+
+    def _set_cli_runtime(self, cli_name: str, resolved_path: str, use_shell: bool) -> None:
+        """Persist the resolved executable details for a CLI."""
+        shell_path = os.environ.get("SHELL", "/bin/sh")
+        if cli_name == "google-antigravity":
+            self.google_antigravity_cli_path = resolved_path
+            self.google_antigravity_cli_use_shell = use_shell
+            self.google_antigravity_shell_path = shell_path
+            return
+        self.codex_cli_path = resolved_path
+        self.codex_cli_use_shell = use_shell
+        self.codex_shell_path = shell_path
+
+    @staticmethod
+    def _validate_cli_config(cli_name: str, cli_path: str, fallback_paths: list[str]) -> None:
+        """Validate configured CLI locator fields."""
+        if not cli_path.strip():
+            raise ValueError(f"'{cli_name}' CLI path must be a non-empty string")
+        if not isinstance(fallback_paths, list):
+            raise ValueError(f"'{cli_name}' CLI fallback paths must be a list of strings")
+        if not all(isinstance(path, str) and path.strip() for path in fallback_paths):
+            raise ValueError(f"'{cli_name}' CLI fallback paths must contain non-empty strings")
 
     @staticmethod
     def _is_available_in_login_shell(command: str) -> bool:
@@ -179,5 +284,6 @@ class UserSessionState:
 
     current_session: str | None = None
     sessions: dict[str, list[dict[str, str]]] = field(default_factory=dict)
-    backend_sessions: dict[str, str] = field(default_factory=dict)
+    backend_sessions: dict[str, dict[str, str]] = field(default_factory=dict)
+    session_project_paths: dict[str, str] = field(default_factory=dict)
     language: str = "zh"

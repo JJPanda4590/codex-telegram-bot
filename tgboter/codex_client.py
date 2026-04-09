@@ -39,12 +39,19 @@ class CodexUsage:
 class CodexStreamEvent:
     """Structured stream event emitted while the Codex CLI runs."""
 
-    kind: Literal["assistant_text", "tool_started", "tool_completed"]
+    kind: Literal[
+        "assistant_text",
+        "tool_started",
+        "tool_completed",
+        "file_change_started",
+        "file_change_completed",
+    ]
     item_id: str | None = None
     text: str | None = None
     command: str | None = None
     output: str | None = None
     exit_code: int | None = None
+    changes: list[dict[str, str]] | None = None
 
 
 class CodexExecutionStopped(RuntimeError):
@@ -56,43 +63,44 @@ class CodexClient:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.project_path = Path(config.project_path).resolve()
         self._process_lock = asyncio.Lock()
         self._active_processes: dict[int, asyncio.subprocess.Process] = {}
         self._stopped_pids: set[int] = set()
 
-    def set_project_path(self, project_path: str | Path) -> None:
-        """Update the active project directory used for Codex CLI calls."""
-        self.project_path = Path(project_path).expanduser().resolve()
-        self.config.project_path = str(self.project_path)
-
     async def send_message(
         self,
         prompt: str,
+        project_path: str | Path,
         backend_session_id: str | None = None,
         on_event: Callable[[CodexStreamEvent], Awaitable[None]] | None = None,
     ) -> CodexResult:
         """Send a prompt to Codex CLI and return the assistant reply."""
-        command = self._build_command(prompt, backend_session_id=backend_session_id)
+        resolved_project_path = Path(project_path).expanduser().resolve()
+        command = self._build_command(
+            prompt,
+            project_path=resolved_project_path,
+            backend_session_id=backend_session_id,
+        )
         LOGGER.info(
-            "Executing Codex CLI session=%s model=%s cwd=%s",
+            "Executing CLI backend=%s session=%s model=%s cwd=%s",
+            self.config.active_cli,
             backend_session_id or "(new)",
             self.config.codex_model,
-            self.project_path,
+            resolved_project_path,
         )
-        if self.config.codex_cli_use_shell:
+        if self.config.cli_use_shell():
             process = await asyncio.create_subprocess_exec(
-                self.config.codex_shell_path,
+                self.config.cli_shell_path(),
                 "-lc",
                 shlex.join(command),
-                cwd=str(self.project_path),
+                cwd=str(resolved_project_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         else:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=str(self.project_path),
+                cwd=str(resolved_project_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -186,6 +194,37 @@ class CodexClient:
                         )
                         continue
 
+                if item_type == "file_change":
+                    if on_event is None:
+                        continue
+                    raw_changes = item.get("changes")
+                    changes = [
+                        {
+                            "path": str(change.get("path", "")),
+                            "kind": str(change.get("kind", "update")),
+                        }
+                        for change in raw_changes
+                        if isinstance(change, dict)
+                    ] if isinstance(raw_changes, list) else None
+                    if event_type == "item.started":
+                        await on_event(
+                            CodexStreamEvent(
+                                kind="file_change_started",
+                                item_id=item.get("id"),
+                                changes=changes,
+                            )
+                        )
+                        continue
+                    if event_type == "item.completed":
+                        await on_event(
+                            CodexStreamEvent(
+                                kind="file_change_completed",
+                                item_id=item.get("id"),
+                                changes=changes,
+                            )
+                        )
+                        continue
+
                 if event_type == "item.completed" and item_type == "agent_message" and item.get("text"):
                     reply_chunks.append(item["text"])
                     await push_update()
@@ -269,7 +308,13 @@ class CodexClient:
                     return
                 await process.wait()
 
-    def _build_command(self, prompt: str, backend_session_id: str | None) -> list[str]:
+    def _build_command(
+        self,
+        prompt: str,
+        *,
+        project_path: Path,
+        backend_session_id: str | None,
+    ) -> list[str]:
         """Build the command line for a new or resumed Codex session."""
         reasoning_args = [
             "-c",
@@ -278,7 +323,7 @@ class CodexClient:
 
         if backend_session_id:
             return [
-                self.config.codex_cli_path,
+                self.config.cli_path(),
                 "exec",
                 "resume",
                 backend_session_id,
@@ -292,7 +337,7 @@ class CodexClient:
             ]
 
         return [
-            self.config.codex_cli_path,
+            self.config.cli_path(),
             "exec",
             "--skip-git-repo-check",
             "--json",
@@ -301,7 +346,7 @@ class CodexClient:
             self.config.codex_model,
             *reasoning_args,
             "-C",
-            str(self.project_path),
+            str(project_path),
             prompt,
         ]
 
